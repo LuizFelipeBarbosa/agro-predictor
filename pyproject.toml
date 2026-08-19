@@ -1,0 +1,30 @@
+[project]
+name = "agro-predictor"
+version = "0.1.0"
+description = "Agricultural land-use classification for Mato Grosso do Sul from Brasil Data Cube time series (sits/pysits)"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "pysits>=1.5.4",
+    "geopandas>=1.1",
+]
+
+[project.scripts]
+agro-predictor = "agro_predictor.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agro_predictor"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
