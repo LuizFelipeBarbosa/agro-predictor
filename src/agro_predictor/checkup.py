@@ -24,7 +24,7 @@ def check_setup() -> bool:
         try:
             detail = check()
             print(f"PASS  {label}" + (f" — {detail}" if detail else ""))
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 — every failure must print its remedy
             print(f"FAIL  {label}\n      {error}")
             all_ok = False
     return all_ok
@@ -49,6 +49,7 @@ def _check_r_packages() -> str:
             ["Rscript", "-e", f'cat(as.character(packageVersion("{package}")))'],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode != 0:
             raise RuntimeError(

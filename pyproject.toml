@@ -7,6 +7,9 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "pysits>=1.5.4",
     "geopandas>=1.1",
+    # pysits 1.5.4 imports pandas._typing.Self, removed in pandas 3
+    "pandas>=2.2.3,<3",
+    "rasterio>=1.4.4",
 ]
 
 [project.scripts]

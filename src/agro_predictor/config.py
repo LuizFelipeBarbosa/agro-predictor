@@ -13,9 +13,11 @@ MS_BOUNDARY_PATH = ROI_DIR / "ms_boundary.geojson"
 # required; if the user sets one, sits picks it up from the environment.
 BDC_STAC_URL = "https://data.inpe.br/bdc/stac/v1"
 
-# MOD13Q1 has 23 16-day composites per year; a Sep 1 -> Aug 31 crop-year
-# window yields exactly 23 instances, matching the training samples' timeline.
-CROP_YEAR_START = "2023-09-01"
+# MOD13Q1 has 23 16-day composites per year. BDC's composite periods start
+# Aug 29 / Sep 14 / ...; starting Sep 14 yields exactly 23 instances through
+# Aug 28, matching the training samples' timeline (a Sep 1 start pulls in the
+# overlapping Aug 29 composite and yields 24).
+CROP_YEAR_START = "2023-09-14"
 CROP_YEAR_END = "2024-08-31"
 
 # ~55 x 50 km over the Maracaju/Dourados soy belt, chosen so that soy,

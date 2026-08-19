@@ -4,15 +4,16 @@ Follows the canonical sits workflow. sits streams the Brasil Data Cube COGs
 over HTTP during classification, so there is no separate download step.
 """
 
+import os
 from pathlib import Path
 
 from pysits import (
-    plot,
     sits_accuracy_summary,
     sits_classify,
     sits_cube,
     sits_kfold_validate,
     sits_label_classification,
+    sits_labels,
     sits_rfor,
     sits_smooth,
     sits_timeline,
@@ -46,7 +47,26 @@ def check_timeline(cube) -> None:
         )
 
 
+# GDAL streams the BDC imagery over HTTP; without these, a dropped connection
+# stalls the classification forever instead of retrying. HTTP/1.1 avoids the
+# HTTP/2 PROTOCOL_ERRORs some networks produce. os.environ is inherited by the
+# R session and its workers. setdefault keeps user overrides in charge.
+GDAL_HTTP_DEFAULTS = {
+    "GDAL_HTTP_VERSION": "1.1",
+    "GDAL_HTTP_CONNECTTIMEOUT": "30",
+    "GDAL_HTTP_TIMEOUT": "120",
+    "GDAL_HTTP_MAX_RETRY": "10",
+    "GDAL_HTTP_RETRY_DELAY": "5",
+}
+
+
+def _configure_gdal_http() -> None:
+    for key, value in GDAL_HTTP_DEFAULTS.items():
+        os.environ.setdefault(key, value)
+
+
 def run(config: RunConfig) -> Path:
+    _configure_gdal_http()
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -87,7 +107,7 @@ def run(config: RunConfig) -> Path:
         version=config.version,
     )
 
-    _save_preview(class_map, output_dir / "classified_preview.png")
+    _save_preview(class_map, output_dir)
     print(f"Done. Outputs in {output_dir}")
     return output_dir
 
@@ -108,9 +128,62 @@ def validate(multicores: int = 4) -> None:
     print(sits_accuracy_summary(assessment))
 
 
-def _save_preview(class_map, path: Path) -> None:
+# Conventional land-cover colors for the sample-set classes; unknown labels
+# fall back to matplotlib's tab10 palette.
+PREVIEW_COLORS = {
+    "Cerrado": "#a1d99b",
+    "Forest": "#00441b",
+    "Pasture": "#fee391",
+    "Soy_Corn": "#ec7014",
+    "Soy_Cotton": "#807dba",
+    "Soy_Fallow": "#fdd0a2",
+    "Soy_Millet": "#d94801",
+}
+
+
+def _save_preview(class_map, output_dir: Path) -> None:
     try:
-        plot(class_map).save(path)
-        print(f"Preview saved: {path}")
-    except Exception as error:
+        labels = [str(label) for label in sits_labels(class_map)]
+        class_tif = max(output_dir.glob("*_class_*.tif"), key=lambda p: p.stat().st_mtime)
+        render_preview(class_tif, labels, output_dir / "classified_preview.png")
+    except Exception as error:  # noqa: BLE001 — the preview is cosmetic, never fail the run
         print(f"Preview PNG failed ({error}); open the *_class_*.tif in QGIS instead.")
+
+
+def render_preview(class_tif: Path, labels: list[str], path: Path) -> None:
+    """Render a classified GeoTIFF (pixel values 1..len(labels)) to a PNG."""
+    import numpy as np
+    import rasterio
+    from matplotlib import colors as mcolors
+    from matplotlib import patches
+    from matplotlib import pyplot as plt
+
+    with rasterio.open(class_tif) as src:
+        data = src.read(1)
+
+    fallback = plt.get_cmap("tab10")
+    hex_colors = [
+        PREVIEW_COLORS.get(label, mcolors.to_hex(fallback(i % 10)))
+        for i, label in enumerate(labels)
+    ]
+    masked = np.ma.masked_outside(data, 1, len(labels))
+
+    fig, ax = plt.subplots(figsize=(10, 7), dpi=150)
+    ax.imshow(
+        masked,
+        cmap=mcolors.ListedColormap(hex_colors),
+        vmin=1,
+        vmax=len(labels),
+        interpolation="nearest",
+    )
+    ax.set_axis_off()
+    ax.set_title(class_tif.stem, fontsize=9)
+    handles = [
+        patches.Patch(color=color, label=label)
+        for color, label in zip(hex_colors, labels)
+    ]
+    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Preview saved: {path}")

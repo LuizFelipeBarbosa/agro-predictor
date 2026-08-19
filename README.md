@@ -77,10 +77,16 @@ Classes: Cerrado, Forest, Pasture, Soy_Corn, Soy_Cotton, Soy_Fallow, Soy_Millet.
 ## Troubleshooting
 
 - **`import pysits` fails / R_HOME errors** — `export R_HOME="$(R RHOME)"`; if
-  R was upgraded, rebuild the bridge: `uv pip install --force-reinstall --no-cache rpy2`.
-- **Never install R via the Homebrew `r` formula** — use the cask
-  (`brew install --cask r`). The formula's R compiles every CRAN package from
-  source (sf/terra need gdal/proj/udunits, 1 h+); the cask gets prebuilt binaries.
+  R was upgraded, rebuild the bridge:
+  `uv pip install --force-reinstall --no-deps --no-binary :all: rpy2-rinterface`.
+- **Formula R vs cask R** — the bootstrap uses the Homebrew `r` formula, which
+  compiles every CRAN package from source (~1 h first run; sf/terra need the
+  gdal/proj/geos/udunits libraries the script installs). If you have admin
+  rights, `brew install --cask r` + CRAN's prebuilt binary packages is much
+  faster — but never mix the two R installations.
+- **pandas 3 incompatibility** — pysits 1.5.4 imports `pandas._typing.Self`,
+  removed in pandas 3; this project pins `pandas<3` (already handled in
+  pyproject.toml).
 - **Timeline mismatch error** — the cube window must contain exactly 23
   MOD13Q1 composites; shift `--start` to the first composite on/after Sep 1
   (e.g. `2023-09-14`).
