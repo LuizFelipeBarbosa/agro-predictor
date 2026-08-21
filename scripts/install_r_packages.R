@@ -20,6 +20,7 @@ install_with_retry("remotes", function() install.packages("remotes"))
 install_with_retry("kohonen", function() install.packages("kohonen"))
 install_with_retry("randomForest", function() install.packages("randomForest"))
 install_with_retry("e1071", function() install.packages("e1071"))
+install_with_retry("caret", function() install.packages("caret"))  # sits_kfold_validate
 
 # Training samples live in the GitHub-only sitsdata package (large download).
 install_with_retry("sitsdata", function() remotes::install_github("e-sensing/sitsdata"))

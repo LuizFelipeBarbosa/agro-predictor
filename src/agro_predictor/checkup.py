@@ -18,6 +18,7 @@ def check_setup() -> bool:
         ("pysits import (rpy2 bridge)", _check_pysits),
         ("BDC STAC reachable", _check_bdc_stac),
         ("BDC cube creation", _check_cube_build),
+        ("labels table (optional)", _check_labels),
     ]
     all_ok = True
     for label, check in checks:
@@ -96,3 +97,24 @@ def _check_cube_build() -> str:
         bands=["NDVI"],
     )
     return "built a small test cube from BDC"
+
+
+def _check_labels() -> str:
+    from agro_predictor import config, labels
+
+    if not config.LABELS_CSV_PATH.exists():
+        return "no labels.csv (optional)"
+
+    try:
+        labels_table = labels.load_labels()
+    except ValueError as error:
+        raise RuntimeError(
+            f"{error}\n      Remedy: fix the rows above in data/labels/labels.csv"
+        ) from error
+
+    distinct_labels = set(labels_table["label"])
+    beyond_canned = len(distinct_labels.difference(labels.CANNED_CLASSES))
+    return (
+        f"{len(labels_table)} points, {len(distinct_labels)} classes "
+        f"({beyond_canned} beyond canned set)"
+    )

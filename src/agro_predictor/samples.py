@@ -19,6 +19,17 @@ def load_training_samples(bands: tuple[str, ...]):
     return sits_select(samples, bands=list(bands))
 
 
+def combine_samples(canned, user):
+    """Row-bind two sits sample sets into one training set."""
+    from pysits.models.data.ts import SITSTimeSeriesModel
+    from rpy2.robjects.packages import importr
+
+    dplyr = importr("dplyr")
+    # Deliberate private-attribute access is contained at the pysits/R boundary.
+    combined = dplyr.bind_rows(canned._instance, user._instance)
+    return SITSTimeSeriesModel(combined)
+
+
 def describe_samples() -> None:
     samples = load_samples(SAMPLES_NAME, package="sitsdata")
     print(f"Dataset: {SAMPLES_NAME} (sitsdata)")

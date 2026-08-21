@@ -5,6 +5,8 @@ __pycache__/
 .ruff_cache/
 output/
 data/roi/*.geojson
+data/labels/cache/
+data/labels/*.rds
 .env
 *.tif
 .DS_Store

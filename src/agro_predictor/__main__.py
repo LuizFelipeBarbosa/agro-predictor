@@ -7,6 +7,7 @@ tests) work before R is installed.
 
 import argparse
 from dataclasses import replace
+from pathlib import Path
 
 
 def main() -> int:
@@ -17,10 +18,13 @@ def main() -> int:
 
         return 0 if check_setup() else 1
 
+    if args.command == "labels":
+        return _labels_command(args)
+
     if args.command == "fetch-roi":
         from agro_predictor.roi import describe_boundary
 
-        describe_boundary()
+        describe_boundary(args.state)
         return 0
 
     if args.command == "samples-info":
@@ -32,14 +36,39 @@ def main() -> int:
     if args.command == "validate":
         from agro_predictor.pipeline import validate
 
-        validate(multicores=args.multicores)
+        validate(multicores=args.multicores, use_labels=not args.no_labels)
+        return 0
+
+    if args.command == "make-samples":
+        from agro_predictor import config
+        from agro_predictor.mapbiomas import sample_state
+
+        start = args.start or config.CROP_YEAR_START
+        end = args.end or config.CROP_YEAR_END
+        frame = sample_state(args.state, start, end, per_class=args.per_class)
+        if frame.empty:
+            print("No usable samples found; try more windows or a larger per-class quota.")
+            return 1
+        dest = config.LABELS_DIR / f"mapbiomas_{args.state.lower()}_{start}_{end}.csv"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(dest, index=False)
+        print(f"Wrote {len(frame)} samples: {dest}")
         return 0
 
     if args.command == "run":
+        from pathlib import Path
+
         from agro_predictor import config
         from agro_predictor.pipeline import run
 
-        cfg = config.smoke() if args.preset == "smoke" else config.full_state()
+        if args.preset == "smoke":
+            cfg = config.smoke()
+        else:
+            cfg = config.full_state(
+                args.state,
+                start_date=args.start or config.CROP_YEAR_START,
+                end_date=args.end or config.CROP_YEAR_END,
+            )
         overrides = {
             "start_date": args.start,
             "end_date": args.end,
@@ -47,10 +76,90 @@ def main() -> int:
             "multicores": args.multicores,
         }
         cfg = replace(cfg, **{key: value for key, value in overrides.items() if value})
+        cfg = replace(cfg, use_labels=not args.no_labels)
+        if args.samples_csv:
+            cfg = replace(cfg, samples_csv=Path(args.samples_csv))
         run(cfg)
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+def _labels_command(args: argparse.Namespace) -> int:
+    try:
+        if args.labels_command == "add":
+            from agro_predictor.labels import add_label, load_labels
+
+            add_label(
+                args.lon,
+                args.lat,
+                args.label,
+                start_date=args.start,
+                end_date=args.end,
+                source=args.source,
+                note=args.note,
+                path=args.file,
+            )
+            print(f"Added 1 label. Total rows: {len(load_labels(args.file))}")
+            return 0
+
+        elif args.labels_command == "import":
+            from agro_predictor.labels import import_labels, load_labels
+
+            imported = import_labels(args.csv_path, args.file)
+            total = len(load_labels(args.file))
+            print(f"Imported/merged {imported} rows. Total rows: {total}")
+            return 0
+
+        elif args.labels_command == "list":
+            from agro_predictor.labels import load_labels
+
+            labels = load_labels(args.file)
+            if labels.empty:
+                print(f"No labels yet: {args.file}")
+            elif args.label:
+                labels = labels[labels["label"] == args.label]
+                if labels.empty:
+                    print(f"No labels matching --label {args.label}")
+                else:
+                    print(labels.to_string(index=False))
+            else:
+                print(labels.to_string(index=False))
+            return 0
+
+        elif args.labels_command == "summary":
+            from agro_predictor.labels import summarize_labels
+
+            summarize_labels(args.file)
+            return 0
+
+        elif args.labels_command == "extract":
+            from agro_predictor import config
+            from agro_predictor.pipeline import extract_labeled_samples
+
+            overrides = {
+                "start_date": args.start,
+                "end_date": args.end,
+                "multicores": args.multicores,
+            }
+            cfg = replace(
+                config.smoke(),
+                **{key: value for key, value in overrides.items() if value},
+            )
+            if extract_labeled_samples(cfg) is None:
+                print("No labels to extract")
+            return 0
+
+        elif args.labels_command == "review":
+            from agro_predictor.pipeline import export_review
+
+            print(export_review(args.run, version=args.version))
+            return 0
+
+        raise AssertionError(f"unhandled labels command: {args.labels_command}")
+    except (ValueError, RuntimeError) as error:
+        print(str(error))
+        return 1
 
 
 def _parse_args() -> argparse.Namespace:
@@ -61,18 +170,80 @@ def _parse_args() -> argparse.Namespace:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("check", help="verify the R/sits/pysits/BDC setup")
-    sub.add_parser("fetch-roi", help="download and cache the MS state boundary")
+
+    from agro_predictor import config
+
+    labels_parser = sub.add_parser("labels", help="manage user-maintained labels")
+    labels_sub = labels_parser.add_subparsers(dest="labels_command", required=True)
+
+    labels_add = labels_sub.add_parser("add", help="add one label")
+    labels_add.add_argument("--lon", type=float, required=True)
+    labels_add.add_argument("--lat", type=float, required=True)
+    labels_add.add_argument("--label", required=True)
+    labels_add.add_argument("--start")
+    labels_add.add_argument("--end")
+    labels_add.add_argument("--source", default="")
+    labels_add.add_argument("--note", default="")
+    labels_add.add_argument("--file", type=Path, default=config.LABELS_CSV_PATH)
+
+    labels_import = labels_sub.add_parser("import", help="import labels from CSV")
+    labels_import.add_argument("csv_path", type=Path)
+    labels_import.add_argument("--file", type=Path, default=config.LABELS_CSV_PATH)
+
+    labels_list = labels_sub.add_parser("list", help="list labels")
+    labels_list.add_argument("--label")
+    labels_list.add_argument("--file", type=Path, default=config.LABELS_CSV_PATH)
+
+    labels_summary = labels_sub.add_parser("summary", help="summarize labels")
+    labels_summary.add_argument("--file", type=Path, default=config.LABELS_CSV_PATH)
+
+    labels_extract = labels_sub.add_parser(
+        "extract",
+        help="extract time series for labels (warms the cache; ROI comes from the labels)",
+    )
+    labels_extract.add_argument("--start", help="override start date (YYYY-MM-DD)")
+    labels_extract.add_argument("--end", help="override end date (YYYY-MM-DD)")
+    labels_extract.add_argument("--multicores", type=int, help="override worker count")
+
+    labels_review = labels_sub.add_parser("review", help="export review CSV for a past run")
+    labels_review.add_argument("--run", required=True)
+    labels_review.add_argument(
+        "--version",
+        default=None,
+        help="cube version (defaults to the one recorded in run_labels.json)",
+    )
+
+    fetch_roi = sub.add_parser("fetch-roi", help="download and cache a state boundary")
+    fetch_roi.add_argument("--state", default="MS", help="state code (UF), e.g. MS, GO")
     sub.add_parser("samples-info", help="describe the training sample set")
 
     validate = sub.add_parser("validate", help="5-fold cross-validation of the model")
     validate.add_argument("--multicores", type=int, default=4)
+    validate.add_argument(
+        "--no-labels", action="store_true", help="train on canned samples only"
+    )
+
+    make_samples = sub.add_parser(
+        "make-samples",
+        help="build era-calibrated training points from MapBiomas",
+    )
+    make_samples.add_argument("--state", default="MS", help="state code (UF)")
+    make_samples.add_argument("--start", help="crop-year start (YYYY-MM-DD)")
+    make_samples.add_argument("--end", help="crop-year end (YYYY-MM-DD)")
+    make_samples.add_argument("--per-class", type=int, default=200)
 
     run = sub.add_parser("run", help="run the classification pipeline")
     run.add_argument("--preset", choices=("smoke", "full"), default="smoke")
+    run.add_argument("--state", default="MS", help="state code (UF) for --preset full")
+    run.add_argument(
+        "--samples-csv",
+        help="train ONLY on series extracted at these points (see make-samples)",
+    )
     run.add_argument("--start", help="override start date (YYYY-MM-DD)")
     run.add_argument("--end", help="override end date (YYYY-MM-DD)")
     run.add_argument("--memsize", type=int, help="override memory budget in GB")
     run.add_argument("--multicores", type=int, help="override worker count")
+    run.add_argument("--no-labels", action="store_true", help="train on canned samples only")
 
     return parser.parse_args()
 

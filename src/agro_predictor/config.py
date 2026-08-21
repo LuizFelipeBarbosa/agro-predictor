@@ -6,7 +6,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_ROOT = PROJECT_ROOT / "output"
 ROI_DIR = PROJECT_ROOT / "data" / "roi"
-MS_BOUNDARY_PATH = ROI_DIR / "ms_boundary.geojson"
+LABELS_DIR = PROJECT_ROOT / "data" / "labels"
+LABELS_CSV_PATH = LABELS_DIR / "labels.csv"
+LABELS_CACHE_DIR = LABELS_DIR / "cache"
 
 # BDC data on data.inpe.br is open access (verified 2026-08: anonymous range
 # requests succeed) and sits ships a default token, so no BDC_ACCESS_KEY is
@@ -29,6 +31,15 @@ SMOKE_BBOX = {
     "lat_max": -21.35,
 }
 
+# Mainland Brazil, loose sanity bounds for label coordinates (catches swapped
+# or positive coordinates, not state membership).
+BRAZIL_BBOX = {
+    "lon_min": -74.1,
+    "lat_min": -33.8,
+    "lon_max": -34.7,
+    "lat_max": 5.3,
+}
+
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -42,6 +53,10 @@ class RunConfig:
     memsize_gb: int = 8
     multicores: int = 4
     version: str = "v1"
+    use_labels: bool = True
+    # When set, train ONLY on series extracted at these points (era-calibrated
+    # samples, e.g. from MapBiomas) instead of the canned sitsdata set.
+    samples_csv: Path | None = None
 
     @property
     def output_dir(self) -> Path:
@@ -57,12 +72,17 @@ def smoke() -> RunConfig:
     )
 
 
-def full_state() -> RunConfig:
+def full_state(
+    uf: str = "MS",
+    start_date: str = CROP_YEAR_START,
+    end_date: str = CROP_YEAR_END,
+) -> RunConfig:
+    uf = uf.lower()
     return RunConfig(
-        name="ms-2023-2024",
-        start_date=CROP_YEAR_START,
-        end_date=CROP_YEAR_END,
-        roi=MS_BOUNDARY_PATH,
+        name=f"{uf}-{start_date[:4]}-{end_date[:4]}",
+        start_date=start_date,
+        end_date=end_date,
+        roi=ROI_DIR / f"{uf}_boundary.geojson",
         memsize_gb=12,
         multicores=6,
     )

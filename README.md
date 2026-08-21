@@ -39,15 +39,53 @@ hard dependency.
 ## Usage
 
 ```sh
-uv run agro-predictor fetch-roi           # cache the MS state boundary (IBGE)
-uv run agro-predictor samples-info        # inspect the training samples
-uv run agro-predictor validate            # 5-fold cross-validation (confusion matrix, kappa)
-uv run agro-predictor run --preset smoke  # small bbox in the Dourados soy belt (~10-30 min)
-uv run agro-predictor run --preset full   # whole state (several GB streamed, hours)
+uv run agro-predictor fetch-roi --state GO           # cache a state boundary (IBGE)
+uv run agro-predictor samples-info                    # inspect the training samples
+uv run agro-predictor validate                        # 5-fold cross-validation (confusion matrix, kappa)
+uv run agro-predictor run --preset smoke              # small bbox in the Dourados soy belt (~10-30 min)
+uv run agro-predictor run --preset full --state GO    # whole state (several GB streamed, hours)
 ```
 
 `run` accepts `--start/--end` (crop-year window), `--memsize` (GB) and
-`--multicores` overrides.
+`--multicores` overrides. `--state` defaults to `MS` for `fetch-roi` and the
+`full` preset; the `smoke` preset always uses the Dourados-area bbox.
+
+## Ground truth labels
+
+- Add or import labels. They merge into training automatically.
+- Run the pipeline, then inspect `output/<run>/review.csv` for the prediction
+  and your label at each point, with mismatches first.
+- Correct or extend the labels and re-run.
+
+The git-tracked table is `data/labels/labels.csv`:
+
+| Columns | Content |
+|---|---|
+| `longitude, latitude, start_date, end_date, label` | sits-native sample fields |
+| `source, note, added_on` | provenance |
+
+Omitted dates default to the crop-year window. Labels may use the seven canned
+classes or add new classes such as `Sugarcane`; new classes appear in the map
+legend and receive automatic preview colors.
+
+```sh
+uv run agro-predictor labels add --lon -55.3 --lat -21.5 --label Sugarcane
+uv run agro-predictor labels import points.csv
+uv run agro-predictor labels list
+uv run agro-predictor labels summary
+uv run agro-predictor labels extract          # warm the extraction cache (ROI = the labels' own bbox)
+uv run agro-predictor labels review --run smoke
+```
+
+- When `labels.csv` has entries, `run` and `validate` use them automatically;
+  `--no-labels` opts out.
+- A class needs on the order of dozens of points to influence the random forest;
+  the pipeline warns below 20 samples.
+- A handful of points will appear as mismatches in `review.csv`; that is the
+  correction loop working.
+- Classes with fewer samples than the five folds are excluded from `validate`.
+- `data/labels/cache/` holds extracted time series keyed by content hash. It is
+  gitignored and safe to delete; re-extraction is automatic.
 
 ## Outputs
 
@@ -58,20 +96,25 @@ Each run writes to `output/<run-name>/`:
 | `*_probs_v1.tif` | per-class probability cube |
 | `*_bayes_v1.tif` | Bayesian-smoothed probabilities |
 | `*_class_v1.tif` | final labeled map (open in QGIS) |
+| `*_class_mosaic.tif` | merged final map for multi-tile runs |
 | `classified_preview.png` | quick-look rendering |
+| `run_labels.json` | map legend, needed by `labels review` |
+| `training_labels.csv` | labels table at training start (includes points later dropped for incomplete series) |
+| `review.csv` | predicted vs. user label at each labeled point |
 
-Classes: Cerrado, Forest, Pasture, Soy_Corn, Soy_Cotton, Soy_Fallow, Soy_Millet.
+Classes: Cerrado, Forest, Pasture, Soy_Corn, Soy_Cotton, Soy_Fallow, Soy_Millet;
+user labels can extend this list.
 
 ## Known limitations
 
-- **Sample transfer**: training samples were collected in Mato Grosso (the
-  neighbor state). Land-cover types absent from the training set — Pantanal
+- **Sample transfer**: the canned samples were collected in Mato Grosso (the
+  neighbor state). Without local labels, types absent from that set — Pantanal
   wetlands, open water, sugarcane, planted forest — are forced into the nearest
-  available class. Treat the map as a working pipeline baseline, not a
-  publishable product.
+  available class. Add missing classes through [Ground truth labels](#ground-truth-labels).
+  Treat the map as a working pipeline baseline, not a publishable product.
 - **Model vs map accuracy**: `validate` reports cross-validated model accuracy
-  on the training samples; true map accuracy for MS would require local ground
-  truth.
+  on the training samples; true map accuracy for the target state requires local
+  ground truth.
 - Single crop year per run (change dates via `--start/--end`).
 
 ## Troubleshooting
