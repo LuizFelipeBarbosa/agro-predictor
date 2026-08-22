@@ -8,7 +8,9 @@ import dataclasses
 import json
 import os
 import tempfile
+import traceback
 from collections import Counter
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -29,6 +31,7 @@ from pysits import (
     sits_train,
 )
 
+from agro_predictor import areas
 from agro_predictor.config import LABELS_CACHE_DIR, OUTPUT_ROOT, RunConfig
 from agro_predictor.labels import (
     canonical_frame,
@@ -46,6 +49,17 @@ from agro_predictor.samples import (
 
 
 def build_cube(config: RunConfig):
+    if config.local_data_dir is not None:
+        return sits_cube(
+            source=config.source,
+            collection=config.collection,
+            data_dir=str(config.local_data_dir),
+            start_date=config.start_date,
+            end_date=config.end_date,
+            bands=list(config.bands),
+            parse_info=["satellite", "sensor", "tile", "band", "date"],
+        )
+
     return sits_cube(
         source=config.source,
         collection=config.collection,
@@ -395,7 +409,7 @@ def run(config: RunConfig) -> Path:
         except Exception as error:  # noqa: BLE001 — review is optional after a finished run
             print(f"Review export failed ({error}); run labels review for this run later.")
 
-    _mosaic_and_preview(output_dir, config.name, labels)
+    _finalize(output_dir, config.name, config)
     print(f"Done. Outputs in {output_dir}")
     return output_dir
 
@@ -555,7 +569,11 @@ def _symlink_result_tifs(output_dir: Path, scratch_dir: Path, band: str) -> Path
     return data_dir
 
 
-def validate(multicores: int = 4, use_labels: bool = True) -> None:
+def validate(
+    multicores: int = 4,
+    use_labels: bool = True,
+    samples_csv: Path | None = None,
+) -> None:
     """Run 5-fold cross-validation on the available training samples.
 
     User-labeled samples are included when present and enabled. Classes with
@@ -563,12 +581,28 @@ def validate(multicores: int = 4, use_labels: bool = True) -> None:
     Accuracy on training samples is not map accuracy for the classified region;
     assessing that requires independent local ground truth.
     """
-    from agro_predictor.config import smoke
+    if samples_csv is not None:
+        rds_path = Path(samples_csv).with_suffix(".rds")
+        if not rds_path.exists():
+            raise RuntimeError(
+                f"No cached samples at {rds_path}; run "
+                f"`agro-predictor run --samples-csv {samples_csv}` once first to "
+                "build the cache (extraction needs a cube/network; validate stays cheap)."
+            )
+        if rds_path.stat().st_mtime < Path(samples_csv).stat().st_mtime:
+            raise RuntimeError(
+                f"Samples CSV {samples_csv} changed since extraction; run "
+                f"`agro-predictor run --samples-csv {samples_csv}` again to "
+                "re-extract before validating."
+            )
+        samples = read_rds(str(rds_path))
+    else:
+        from agro_predictor.config import smoke
 
-    config = dataclasses.replace(
-        smoke(), multicores=multicores, use_labels=use_labels
-    )
-    samples = load_run_samples(config)
+        config = dataclasses.replace(
+            smoke(), multicores=multicores, use_labels=use_labels
+        )
+        samples = load_run_samples(config)
     counts = _class_counts(samples)
     excluded = {label: count for label, count in counts.items() if count < 5}
     for label, count in excluded.items():
@@ -581,96 +615,42 @@ def validate(multicores: int = 4, use_labels: bool = True) -> None:
     assessment = sits_kfold_validate(
         samples, folds=5, ml_method=sits_rfor(), multicores=multicores
     )
-    print(sits_accuracy_summary(assessment))
+    summary = sits_accuracy_summary(assessment)
+    print(summary)
 
+    summary_text = str(summary)
+    assessment_text = str(assessment)
+    if assessment_text.strip() and assessment_text.strip() != summary_text.strip():
+        summary_text = f"{summary_text.rstrip()}\n\n{assessment_text.rstrip()}"
 
-# Conventional land-cover colors for the sample-set classes; unknown labels
-# fall back to matplotlib's tab10 palette.
-PREVIEW_COLORS = {
-    "Cerrado": "#a1d99b",
-    "Forest": "#00441b",
-    "Pasture": "#fee391",
-    "Soy_Corn": "#ec7014",
-    "Soy_Cotton": "#807dba",
-    "Soy_Fallow": "#fdd0a2",
-    "Soy_Millet": "#d94801",
-    "Soybean": "#ec7014",
-    "Planted_Forest": "#238b45",
-    "Grassland": "#d9f0a3",
-    "Wetland": "#41b6c4",
-    "Water": "#225ea8",
-    "Sugarcane": "#dd3497",
-}
-
-
-def _mosaic_and_preview(output_dir: Path, name: str, labels: list[str]) -> None:
-    try:
-        class_tifs = sorted(output_dir.glob("TERRA_MODIS_*_class_*.tif"))
-        if len(class_tifs) == 1:
-            mosaic_tif = class_tifs[0]
-        else:
-            mosaic_tif = output_dir / f"{name}_class_mosaic.tif"
-            _merge_tiles(class_tifs, mosaic_tif)
-            print(f"Mosaic saved: {mosaic_tif}")
-        render_preview(mosaic_tif, labels, output_dir / "classified_preview.png")
-    except Exception as error:  # noqa: BLE001 — mosaic/preview are cosmetic, never fail the run
-        print(f"Mosaic/preview failed ({error}); open the *_class_*.tif in QGIS instead.")
-
-
-def _merge_tiles(tifs: list[Path], dest: Path) -> None:
-    import rasterio
-    from rasterio.merge import merge
-
-    sources = [rasterio.open(tif) for tif in tifs]
-    try:
-        mosaic, transform = merge(sources)
-        meta = sources[0].meta | {
-            "height": mosaic.shape[1],
-            "width": mosaic.shape[2],
-            "transform": transform,
-            "compress": "deflate",
-        }
-        with rasterio.open(dest, "w", **meta) as out:
-            out.write(mosaic)
-    finally:
-        for src in sources:
-            src.close()
-
-
-def render_preview(class_tif: Path, labels: list[str], path: Path) -> None:
-    """Render a classified GeoTIFF (pixel values 1..len(labels)) to a PNG."""
-    import numpy as np
-    import rasterio
-    from matplotlib import colors as mcolors
-    from matplotlib import patches
-    from matplotlib import pyplot as plt
-
-    with rasterio.open(class_tif) as src:
-        data = src.read(1)
-
-    fallback = plt.get_cmap("tab10")
-    hex_colors = [
-        PREVIEW_COLORS.get(label, mcolors.to_hex(fallback(i % 10)))
-        for i, label in enumerate(labels)
-    ]
-    masked = np.ma.masked_outside(data, 1, len(labels))
-
-    fig, ax = plt.subplots(figsize=(10, 7), dpi=150)
-    ax.imshow(
-        masked,
-        cmap=mcolors.ListedColormap(hex_colors),
-        vmin=1,
-        vmax=len(labels),
-        interpolation="nearest",
+    name = Path(samples_csv).stem if samples_csv is not None else "canned"
+    validation_dir = (
+        OUTPUT_ROOT
+        / "validation"
+        / f"{name}-{date.today().isoformat()}"  # noqa: DTZ011
     )
-    ax.set_axis_off()
-    ax.set_title(class_tif.stem, fontsize=9)
-    handles = [
-        patches.Patch(color=color, label=label)
-        for color, label in zip(hex_colors, labels)
-    ]
-    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False)
-    fig.tight_layout()
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Preview saved: {path}")
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = validation_dir / "summary.txt"
+    summary_path.write_text(f"{summary_text.rstrip()}\n", encoding="utf-8")
+    print(f"Validation summary saved: {summary_path}")
+
+
+def _finalize(output_dir: Path, name: str, config: RunConfig) -> None:
+    if isinstance(config.roi, Path):
+        state = Path(config.roi).stem.split("_")[0].upper()
+        clip = True
+    else:
+        state = None
+        clip = False
+    try:
+        areas.compute_run_areas(output_dir, state=state, clip=clip)
+    except Exception:  # noqa: BLE001 — classification outputs are already safely written
+        traceback.print_exc()
+        if clip:
+            command = f"agro-predictor areas --dir {output_dir} --state {state}"
+        else:
+            command = f"agro-predictor areas --dir {output_dir} --no-clip"
+        print(
+            "Areas/preview failed; outputs are safe. Re-run later: "
+            f"{command}"
+        )

@@ -36,7 +36,7 @@ CLASS_MAP = {
     4: "Cerrado",
     9: "Planted_Forest",
     11: "Wetland",
-    12: "Grassland",
+    12: "Pasture",
     15: "Pasture",
     20: "Sugarcane",
     33: "Water",
@@ -57,9 +57,10 @@ def sample_state(
     start_date: str,
     end_date: str,
     per_class: int = 200,
-    max_windows: int = 60,
+    max_windows: int = 200,
     window_px: int = 2048,
     seed: int = 42,
+    min_windows: int = 40,
 ) -> pd.DataFrame:
     """Sample stable, homogeneous MapBiomas points across a state.
 
@@ -71,36 +72,74 @@ def sample_state(
     lon_min, lat_min, lon_max, lat_max = boundary.total_bounds
 
     rng = np.random.default_rng(seed)
-    collected: dict[str, list[tuple[float, float]]] = {v: [] for v in CLASS_MAP.values()}
+    primary = {label: [] for label in CLASS_MAP.values()}
+    overflow = {label: [] for label in CLASS_MAP.values()}
+    primary_windows = {label: set() for label in CLASS_MAP.values()}
+    per_window_cap = max(1, per_class // 5)
 
     old, new = (rasterio.open(MAPBIOMAS_URL.format(year=y)) for y in STABILITY_YEARS)
     try:
         for i in range(max_windows):
-            if all(len(v) >= per_class for v in collected.values()):
+            if _should_stop(primary, per_class, i, min_windows):
                 break
             lon = rng.uniform(lon_min, lon_max)
             lat = rng.uniform(lat_min, lat_max)
+            window_points = {label: [] for label in CLASS_MAP.values()}
             for label, point in _stable_blocks_in_window(new, old, lon, lat, window_px):
-                if len(collected[label]) < per_class * 3:
-                    collected[label].append(point)
+                window_points[label].append(point)
+            for label, points in window_points.items():
+                _accept_window_points(
+                    primary,
+                    overflow,
+                    primary_windows,
+                    label,
+                    points,
+                    i,
+                    per_window_cap,
+                )
             if (i + 1) % 10 == 0:
-                done = {k: len(v) for k, v in collected.items()}
+                done = {label: len(points) for label, points in primary.items()}
                 print(f"window {i + 1}/{max_windows}: {done}")
     finally:
         old.close()
         new.close()
 
+    print(
+        "windows per class:",
+        {label: len(windows) for label, windows in primary_windows.items()},
+    )
     rows = []
-    for label, points in collected.items():
-        inside = [p for p in points if state_shape.contains(Point(p))]
-        if len(inside) < MIN_CLASS_SAMPLES:
-            print(f"Dropping {label}: only {len(inside)} usable points (<{MIN_CLASS_SAMPLES})")
+    for label, points in primary.items():
+        primary_inside = [
+            point for point in points if state_shape.contains(Point(point[:2]))
+        ]
+        overflow_inside = [
+            point for point in overflow[label] if state_shape.contains(Point(point[:2]))
+        ]
+        selection_pool, used_overflow = _selection_pool(
+            primary_inside, overflow_inside, per_class
+        )
+        if used_overflow:
+            contributing_windows = {point[2] for point in selection_pool}
+            print(
+                f"{label} is spatially concentrated: relaxed per-window cap "
+                f"(points from {len(contributing_windows)} window(s))"
+            )
+        if len(selection_pool) < MIN_CLASS_SAMPLES:
+            print(
+                f"Dropping {label}: only {len(selection_pool)} usable points "
+                f"(<{MIN_CLASS_SAMPLES})"
+            )
             continue
-        chosen = rng.choice(len(inside), size=min(per_class, len(inside)), replace=False)
+        chosen = rng.choice(
+            len(selection_pool),
+            size=min(per_class, len(selection_pool)),
+            replace=False,
+        )
         rows += [
             {
-                "longitude": round(inside[j][0], 6),
-                "latitude": round(inside[j][1], 6),
+                "longitude": round(selection_pool[j][0], 6),
+                "latitude": round(selection_pool[j][1], 6),
                 "start_date": start_date,
                 "end_date": end_date,
                 "label": label,
@@ -111,6 +150,63 @@ def sample_state(
     if not frame.empty:
         print("Sampled per class:", frame["label"].value_counts().to_dict())
     return frame
+
+
+def _should_stop(
+    primary: dict[str, list],
+    per_class: int,
+    windows_visited: int,
+    min_windows: int,
+) -> bool:
+    """Return whether every pool is full after enough windows were visited."""
+    return windows_visited >= min_windows and all(
+        len(points) >= per_class for points in primary.values()
+    )
+
+
+def _accept_window_points(
+    primary: dict[str, list[tuple[float, float, int]]],
+    overflow: dict[str, list[tuple[float, float, int]]],
+    primary_windows: dict[str, set[int]],
+    label: str,
+    points: list[tuple[float, float]],
+    window_index: int,
+    per_window_cap: int,
+) -> None:
+    """Retain capped primary and overflow points without overall pool limits."""
+    primary_points = primary[label]
+    overflow_points = overflow[label]
+    primary_count = min(len(points), per_window_cap)
+    overflow_count = min(len(points) - primary_count, per_window_cap)
+
+    new_primary = [(*point, window_index) for point in points[:primary_count]]
+    primary_points.extend(new_primary)
+    if new_primary:
+        primary_windows[label].add(window_index)
+
+    overflow_points.extend(
+        (*point, window_index)
+        for point in points[primary_count : primary_count + overflow_count]
+    )
+
+
+def _selection_pool(
+    primary: list[tuple[float, float, int]],
+    overflow: list[tuple[float, float, int]],
+    per_class: int,
+) -> tuple[list[tuple[float, float, int]], list[tuple[float, float, int]]]:
+    """Return primary points, topped up by overflow in deterministic window order."""
+    if len(primary) >= per_class:
+        return list(primary), []
+
+    ordered_overflow = [
+        point
+        for _, point in sorted(
+            enumerate(overflow), key=lambda item: (item[1][2], item[0])
+        )
+    ]
+    used_overflow = ordered_overflow[: per_class - len(primary)]
+    return [*primary, *used_overflow], used_overflow
 
 
 def _stable_blocks_in_window(new_src, old_src, lon: float, lat: float, window_px: int):

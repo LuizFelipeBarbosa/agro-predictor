@@ -8,25 +8,149 @@ import re
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from agro_predictor import config
-from agro_predictor.config import LABELS_CSV_PATH
+from agro_predictor.config import CANNED_CLASSES, LABELS_CSV_PATH
 
 LABELS_SCHEMA = ("longitude", "latitude", "start_date", "end_date", "label")
 PROVENANCE_COLUMNS = ("source", "note", "added_on")
-CANNED_CLASSES = (
-    "Cerrado",
-    "Forest",
-    "Pasture",
-    "Soy_Corn",
-    "Soy_Cotton",
-    "Soy_Fallow",
-    "Soy_Millet",
-)
 
 _ALL_COLUMNS = LABELS_SCHEMA + PROVENANCE_COLUMNS
 _LABEL_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def spatial_train_holdout_split(
+    df: pd.DataFrame,
+    holdout_fraction: float = 0.2,
+    cell_deg: float = 0.5,
+    seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split sits-schema points by spatial grid cell into train and holdout sets."""
+    longitudes = np.floor(df["longitude"].to_numpy(dtype=float) / cell_deg).astype(int)
+    latitudes = np.floor(df["latitude"].to_numpy(dtype=float) / cell_deg).astype(int)
+    row_cells = list(zip(longitudes, latitudes, strict=True))
+
+    cell_rows: dict[tuple[int, int], list[int]] = {}
+    for row_position, cell in enumerate(row_cells):
+        cell_rows.setdefault(cell, []).append(row_position)
+
+    cells = sorted(cell_rows)
+    shuffled_cells = [
+        cells[position]
+        for position in np.random.default_rng(seed).permutation(len(cells))
+    ]
+    holdout_cells: set[tuple[int, int]] = set()
+    holdout_count = 0
+    holdout_target = holdout_fraction * len(df)
+    for cell in shuffled_cells:
+        if holdout_count >= holdout_target:
+            break
+        holdout_cells.add(cell)
+        holdout_count += len(cell_rows[cell])
+
+    labels = df["label"].to_numpy()
+    label_counts = df["label"].value_counts().to_dict()
+    eligible_labels = sorted(label for label, count in label_counts.items() if count >= 5)
+    label_positions = {label: labels == label for label in eligible_labels}
+    point_assignments = np.full(len(df), -1, dtype=np.int8)
+
+    def current_holdout_mask(
+        cells_in_holdout: set[tuple[int, int]],
+    ) -> np.ndarray:
+        mask = np.fromiter(
+            (cell in cells_in_holdout for cell in row_cells),
+            dtype=bool,
+            count=len(df),
+        )
+        overridden = point_assignments >= 0
+        mask[overridden] = point_assignments[overridden].astype(bool)
+        return mask
+
+    for label in eligible_labels:
+        holdout_mask = current_holdout_mask(holdout_cells)
+        positions = label_positions[label]
+        in_holdout = bool(holdout_mask[positions].any())
+        in_train = bool((~holdout_mask[positions]).any())
+        if in_holdout and in_train:
+            continue
+
+        label_cells = {
+            cell
+            for cell, positions in cell_rows.items()
+            if any(labels[position] == label for position in positions)
+        }
+        candidate_cells = (
+            label_cells - holdout_cells if not in_holdout else label_cells & holdout_cells
+        )
+        candidate_ranks = []
+        for cell in candidate_cells:
+            trial_holdout_cells = set(holdout_cells)
+            if not in_holdout:
+                trial_holdout_cells.add(cell)
+            else:
+                trial_holdout_cells.remove(cell)
+            trial_mask = current_holdout_mask(trial_holdout_cells)
+            if not (
+                trial_mask[positions].any() and (~trial_mask[positions]).any()
+            ):
+                continue
+
+            safe = True
+            for other_label in eligible_labels:
+                if other_label == label:
+                    continue
+                other_positions = label_positions[other_label]
+                other_was_split = holdout_mask[other_positions].any() and (
+                    ~holdout_mask[other_positions]
+                ).any()
+                other_stays_split = trial_mask[other_positions].any() and (
+                    ~trial_mask[other_positions]
+                ).any()
+                if other_was_split and not other_stays_split:
+                    safe = False
+                    break
+            if not safe:
+                continue
+
+            class_count = sum(labels[position] == label for position in cell_rows[cell])
+            other_count = len(cell_rows[cell]) - class_count
+            candidate_ranks.append(((-class_count, other_count, cell), cell))
+
+        if candidate_ranks:
+            _, best_cell = min(candidate_ranks)
+            if not in_holdout:
+                holdout_cells.add(best_cell)
+            else:
+                holdout_cells.remove(best_cell)
+            continue
+
+        row_positions = np.flatnonzero(positions)
+        fallback_seed = int.from_bytes(
+            hashlib.sha256(f"{seed}:{label}".encode()).digest()[:8], "little"
+        )
+        shuffled_positions = np.random.default_rng(fallback_seed).permutation(row_positions)
+        holdout_size = max(
+            1, min(len(row_positions) - 1, round(holdout_fraction * len(row_positions)))
+        )
+        point_assignments[row_positions] = 0
+        point_assignments[shuffled_positions[:holdout_size]] = 1
+        print(
+            f"spatial independence not achieved for {label}: all points in "
+            f"{len(label_cells)} cell(s); using point-level split"
+        )
+
+    holdout_mask = current_holdout_mask(holdout_cells)
+    for label in sorted(label_counts):
+        count = label_counts[label]
+        if count < 5:
+            print(f"{label}: only {count} points (<5); keeping all in train")
+            holdout_mask[labels == label] = False
+
+    train_df = df.loc[~holdout_mask].reset_index(drop=True)
+    holdout_df = df.loc[holdout_mask].reset_index(drop=True)
+    return train_df, holdout_df
 
 
 def load_labels(path: Path = LABELS_CSV_PATH) -> pd.DataFrame:
@@ -61,7 +185,7 @@ def validate_labels(df: pd.DataFrame) -> list[str]:
         return [f"Missing required column(s): {', '.join(missing_columns)}"]
 
     errors = []
-    canonical_classes = {label.casefold(): label for label in CANNED_CLASSES}
+    canonical_classes = {label.casefold(): label for label in config.CLASS_NAMES}
     for row_number, (_, row) in enumerate(df.iterrows(), start=2):
         _validate_coordinate(
             row["longitude"],

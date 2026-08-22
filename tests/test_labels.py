@@ -1,6 +1,7 @@
 import re
 from datetime import date
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -15,6 +16,7 @@ from agro_predictor.labels import (
     import_labels,
     load_labels,
     merge_review_frames,
+    spatial_train_holdout_split,
     validate_labels,
 )
 
@@ -269,3 +271,151 @@ def test_merge_review_frames_combines_sorts_and_preserves_missing_points():
     assert pd.isna(missing["predicted_label"])
     assert not missing["match"]
     assert pd.isna(missing["prob_Pasture"])
+
+
+def _spatial_split_frame() -> pd.DataFrame:
+    rows = []
+    for longitude in (-55.25, -54.75, -54.25, -53.75, -53.25):
+        rows.extend(
+            [
+                {"longitude": longitude, "latitude": -20.25, "label": "Cerrado"},
+                {"longitude": longitude + 0.01, "latitude": -20.24, "label": "Cerrado"},
+                {"longitude": longitude + 0.02, "latitude": -20.23, "label": "Pasture"},
+                {"longitude": longitude + 0.03, "latitude": -20.22, "label": "Pasture"},
+            ]
+        )
+    rows.extend(
+        {"longitude": -52.75 + offset, "latitude": -20.25, "label": "Rare"}
+        for offset in (0.0, 0.01, 0.02)
+    )
+    return pd.DataFrame(rows)
+
+
+def test_spatial_train_holdout_split_is_deterministic_and_stratified():
+    frame = _spatial_split_frame()
+
+    first_train, first_holdout = spatial_train_holdout_split(frame, seed=42)
+    second_train, second_holdout = spatial_train_holdout_split(frame, seed=42)
+
+    pd.testing.assert_frame_equal(first_train, second_train)
+    pd.testing.assert_frame_equal(first_holdout, second_holdout)
+    for label, count in frame["label"].value_counts().items():
+        if count >= 5:
+            assert label in set(first_train["label"])
+            assert label in set(first_holdout["label"])
+    assert (first_train["label"] == "Rare").sum() == 3
+    assert "Rare" not in set(first_holdout["label"])
+
+
+def test_spatial_train_holdout_split_keeps_grid_cells_disjoint_and_approximately_sized():
+    frame = _spatial_split_frame()
+
+    train, holdout = spatial_train_holdout_split(frame, holdout_fraction=0.2, cell_deg=0.5)
+
+    def cells(side: pd.DataFrame) -> set[tuple[int, int]]:
+        return set(
+            zip(
+                np.floor(side["longitude"] / 0.5).astype(int),
+                np.floor(side["latitude"] / 0.5).astype(int),
+                strict=True,
+            )
+        )
+
+    assert cells(train).isdisjoint(cells(holdout))
+    # Whole-cell assignment can overshoot the target by at most this fixture's 4-point cell.
+    assert abs(len(holdout) - 0.2 * len(frame)) <= 4
+
+
+def _cell_rows(label: str, longitude: float, count: int) -> list[dict]:
+    return [
+        {
+            "longitude": longitude + index * 0.001,
+            "latitude": -20.25 + index * 0.001,
+            "label": label,
+        }
+        for index in range(count)
+    ]
+
+
+def test_spatial_split_falls_back_for_classes_colocated_in_one_cell(capsys):
+    frame = pd.DataFrame(
+        [
+            *_cell_rows("Planted_Forest", -54.45, 10),
+            *_cell_rows("Soybean", -54.40, 10),
+        ]
+    )
+
+    train, holdout = spatial_train_holdout_split(frame, seed=42)
+
+    for label in ("Planted_Forest", "Soybean"):
+        assert label in set(train["label"])
+        assert label in set(holdout["label"])
+    output = capsys.readouterr().out
+    assert (
+        "spatial independence not achieved for Planted_Forest: all points in "
+        "1 cell(s); using point-level split"
+    ) in output
+    assert (
+        "spatial independence not achieved for Soybean: all points in "
+        "1 cell(s); using point-level split"
+    ) in output
+
+
+def test_spatial_split_uses_safe_whole_cell_remedy_when_available(capsys):
+    frame = pd.DataFrame(
+        [
+            *_cell_rows("Fixable", -55.25, 3),
+            *_cell_rows("Fixable", -54.75, 3),
+            *_cell_rows("Other", -54.25, 5),
+            *_cell_rows("Other", -53.75, 5),
+        ]
+    )
+
+    train, holdout = spatial_train_holdout_split(frame, seed=42)
+
+    assert "Fixable" in set(train["label"])
+    assert "Fixable" in set(holdout["label"])
+    train_cells = set(np.floor(train.loc[train["label"] == "Fixable", "longitude"] / 0.5))
+    holdout_cells = set(
+        np.floor(holdout.loc[holdout["label"] == "Fixable", "longitude"] / 0.5)
+    )
+    assert train_cells.isdisjoint(holdout_cells)
+    assert "spatial independence not achieved for Fixable" not in capsys.readouterr().out
+
+
+def test_spatial_split_keeps_every_nonrare_class_on_both_sides():
+    frame = pd.DataFrame(
+        [
+            *_cell_rows("Fixable", -55.25, 3),
+            *_cell_rows("Fixable", -54.75, 3),
+            *_cell_rows("Spread", -54.25, 5),
+            *_cell_rows("Spread", -53.75, 5),
+            *_cell_rows("Local_A", -53.25, 6),
+            *_cell_rows("Local_B", -53.20, 6),
+            *_cell_rows("Rare", -52.75, 3),
+        ]
+    )
+
+    train, holdout = spatial_train_holdout_split(frame, seed=7)
+
+    for label, count in frame["label"].value_counts().items():
+        if count >= 5:
+            assert label in set(train["label"])
+            assert label in set(holdout["label"])
+    assert (train["label"] == "Rare").sum() == 3
+    assert "Rare" not in set(holdout["label"])
+
+
+def test_spatial_split_fallback_is_deterministic():
+    frame = pd.DataFrame(
+        [
+            *_cell_rows("Planted_Forest", -54.45, 10),
+            *_cell_rows("Soybean", -54.40, 10),
+        ]
+    )
+
+    first_train, first_holdout = spatial_train_holdout_split(frame, seed=123)
+    second_train, second_holdout = spatial_train_holdout_split(frame, seed=123)
+
+    pd.testing.assert_frame_equal(first_train, second_train)
+    pd.testing.assert_frame_equal(first_holdout, second_holdout)

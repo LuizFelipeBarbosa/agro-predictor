@@ -33,10 +33,27 @@ def main() -> int:
         describe_samples()
         return 0
 
+    if args.command == "split-samples":
+        import pandas as pd
+
+        frame = pd.read_csv(args.csv_path)
+        _write_sample_split(
+            frame,
+            args.csv_path,
+            holdout_fraction=args.holdout_fraction,
+            cell_deg=args.cell_deg,
+            seed=args.seed,
+        )
+        return 0
+
     if args.command == "validate":
         from agro_predictor.pipeline import validate
 
-        validate(multicores=args.multicores, use_labels=not args.no_labels)
+        validate(
+            multicores=args.multicores,
+            use_labels=not args.no_labels,
+            samples_csv=Path(args.samples_csv) if args.samples_csv else None,
+        )
         return 0
 
     if args.command == "make-samples":
@@ -53,13 +70,67 @@ def main() -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(dest, index=False)
         print(f"Wrote {len(frame)} samples: {dest}")
+        train_path, _ = _write_sample_split(frame, dest)
+        print(
+            f"Suggested: uv run agro-predictor run --preset full --state {args.state} "
+            f"--samples-csv {train_path}"
+        )
+        return 0
+
+    if args.command == "areas":
+        from agro_predictor import areas, config
+
+        if args.dir is not None:
+            run_dir = args.dir
+        elif args.preset == "smoke":
+            run_dir = config.smoke().output_dir
+        else:
+            run_dir = config.full_state(args.state).output_dir
+        areas.compute_run_areas(
+            run_dir,
+            state=args.state,
+            clip=not args.no_clip,
+            benchmark=args.compare,
+        )
+        return 0
+
+    if args.command == "validate-map":
+        from agro_predictor import validation
+
+        validation.validate_map(
+            run_dir=Path(args.dir),
+            points_csv=Path(args.points),
+            state=args.state,
+        )
+        return 0
+
+    if args.command == "prefetch":
+        from agro_predictor import config, prefetch
+
+        if args.preset == "smoke":
+            cfg = config.smoke()
+        else:
+            cfg = config.full_state(
+                args.state,
+                start_date=args.start or config.CROP_YEAR_START,
+                end_date=args.end or config.CROP_YEAR_END,
+            )
+        date_overrides = {
+            "start_date": args.start,
+            "end_date": args.end,
+        }
+        cfg = replace(
+            cfg,
+            **{key: value for key, value in date_overrides.items() if value},
+        )
+        cache_dir = prefetch.prefetch_run(cfg)
+        tif_count = sum(1 for _ in cache_dir.glob("*.tif"))
+        print(f"Cache directory: {cache_dir}")
+        print(f"GeoTIFF files: {tif_count}")
         return 0
 
     if args.command == "run":
-        from pathlib import Path
-
         from agro_predictor import config
-        from agro_predictor.pipeline import run
 
         if args.preset == "smoke":
             cfg = config.smoke()
@@ -70,6 +141,7 @@ def main() -> int:
                 end_date=args.end or config.CROP_YEAR_END,
             )
         overrides = {
+            "name": args.name,
             "start_date": args.start,
             "end_date": args.end,
             "memsize_gb": args.memsize,
@@ -79,10 +151,69 @@ def main() -> int:
         cfg = replace(cfg, use_labels=not args.no_labels)
         if args.samples_csv:
             cfg = replace(cfg, samples_csv=Path(args.samples_csv))
+
+        if args.local_data:
+            from agro_predictor import prefetch
+
+            assets = prefetch.list_run_assets(cfg)
+            missing = [
+                prefetch._destination_path(asset, prefetch.DEFAULT_CACHE_DIR)
+                for asset in assets
+                if not prefetch._destination_path(asset, prefetch.DEFAULT_CACHE_DIR).exists()
+            ]
+            if missing:
+                command = (
+                    "agro-predictor prefetch "
+                    f"--preset {args.preset} --state {args.state} "
+                    f"--start {cfg.start_date} --end {cfg.end_date}"
+                )
+                print(
+                    f"Local cache is missing {len(missing)} of {len(assets)} "
+                    "required files. Run this first:\n"
+                    f"  {command}"
+                )
+                return 1
+            cfg = replace(cfg, local_data_dir=prefetch.DEFAULT_CACHE_DIR)
+
+        from agro_predictor.pipeline import run
+
         run(cfg)
         return 0
 
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+def _write_sample_split(
+    frame,
+    csv_path: Path,
+    *,
+    holdout_fraction: float = 0.2,
+    cell_deg: float = 0.5,
+    seed: int = 42,
+) -> tuple[Path, Path]:
+    from agro_predictor import labels
+
+    train, holdout = labels.spatial_train_holdout_split(
+        frame,
+        holdout_fraction=holdout_fraction,
+        cell_deg=cell_deg,
+        seed=seed,
+    )
+    train_path = csv_path.with_name(f"{csv_path.stem}_train.csv")
+    holdout_path = csv_path.with_name(f"{csv_path.stem}_holdout.csv")
+    train.to_csv(train_path, index=False)
+    holdout.to_csv(holdout_path, index=False)
+
+    counts = train["label"].value_counts().rename("train").to_frame()
+    counts = counts.join(
+        holdout["label"].value_counts().rename("holdout"),
+        how="outer",
+    ).fillna(0).astype(int).sort_index()
+    counts.index.name = "label"
+    print(counts.to_string())
+    print(f"Train: {len(train)} samples -> {train_path}")
+    print(f"Holdout: {len(holdout)} samples -> {holdout_path}")
+    return train_path, holdout_path
 
 
 def _labels_command(args: argparse.Namespace) -> int:
@@ -171,6 +302,7 @@ def _parse_args() -> argparse.Namespace:
 
     sub.add_parser("check", help="verify the R/sits/pysits/BDC setup")
 
+    from agro_predictor import areas as areas_module
     from agro_predictor import config
 
     labels_parser = sub.add_parser("labels", help="manage user-maintained labels")
@@ -222,6 +354,19 @@ def _parse_args() -> argparse.Namespace:
     validate.add_argument(
         "--no-labels", action="store_true", help="train on canned samples only"
     )
+    validate.add_argument(
+        "--samples-csv",
+        help="validate cached era samples from this CSV instead of canned samples",
+    )
+
+    split_samples = sub.add_parser(
+        "split-samples",
+        help="split a sits-schema CSV into spatially disjoint train and holdout sets",
+    )
+    split_samples.add_argument("csv_path", type=Path, metavar="CSV_PATH")
+    split_samples.add_argument("--holdout-fraction", type=float, default=0.2)
+    split_samples.add_argument("--cell-deg", type=float, default=0.5)
+    split_samples.add_argument("--seed", type=int, default=42)
 
     make_samples = sub.add_parser(
         "make-samples",
@@ -232,6 +377,39 @@ def _parse_args() -> argparse.Namespace:
     make_samples.add_argument("--end", help="crop-year end (YYYY-MM-DD)")
     make_samples.add_argument("--per-class", type=int, default=200)
 
+    areas = sub.add_parser(
+        "areas",
+        help="compute class areas and regenerate the classified preview",
+    )
+    areas_source = areas.add_mutually_exclusive_group(required=True)
+    areas_source.add_argument("--dir", type=Path, help="existing run directory")
+    areas_source.add_argument("--preset", choices=("smoke", "full"))
+    areas.add_argument("--state", default="MS", help="state code (UF)")
+    areas.add_argument(
+        "--no-clip",
+        action="store_true",
+        help="compute from the un-clipped mosaic",
+    )
+    areas.add_argument(
+        "--compare",
+        choices=list(areas_module.BENCHMARKS),
+        help="compare the modeled percentages with a named benchmark",
+    )
+
+    validate_map = sub.add_parser(
+        "validate-map",
+        help="validate a classified run against reference points",
+    )
+    validate_map.add_argument("--dir", required=True, help="existing run directory")
+    validate_map.add_argument("--points", required=True, help="reference points CSV")
+    validate_map.add_argument("--state", default="MS", help="state code (UF)")
+
+    prefetch = sub.add_parser("prefetch", help="download BDC imagery into the local cache")
+    prefetch.add_argument("--preset", choices=("smoke", "full"), default="smoke")
+    prefetch.add_argument("--state", default="MS", help="state code (UF) for --preset full")
+    prefetch.add_argument("--start", help="override start date (YYYY-MM-DD)")
+    prefetch.add_argument("--end", help="override end date (YYYY-MM-DD)")
+
     run = sub.add_parser("run", help="run the classification pipeline")
     run.add_argument("--preset", choices=("smoke", "full"), default="smoke")
     run.add_argument("--state", default="MS", help="state code (UF) for --preset full")
@@ -239,11 +417,17 @@ def _parse_args() -> argparse.Namespace:
         "--samples-csv",
         help="train ONLY on series extracted at these points (see make-samples)",
     )
+    run.add_argument("--name", help="override the run name (and output/ subdirectory)")
     run.add_argument("--start", help="override start date (YYYY-MM-DD)")
     run.add_argument("--end", help="override end date (YYYY-MM-DD)")
     run.add_argument("--memsize", type=int, help="override memory budget in GB")
     run.add_argument("--multicores", type=int, help="override worker count")
     run.add_argument("--no-labels", action="store_true", help="train on canned samples only")
+    run.add_argument(
+        "--local-data",
+        action="store_true",
+        help="classify from the prefetched local BDC cache",
+    )
 
     return parser.parse_args()
 

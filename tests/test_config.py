@@ -1,3 +1,4 @@
+import re
 from datetime import date
 
 from agro_predictor import config
@@ -50,3 +51,30 @@ def test_brazil_bbox_contains_smoke_bbox():
 def test_presets_use_labels_by_default():
     assert config.smoke().use_labels is True
     assert config.full_state().use_labels is True
+
+
+def test_class_registry_invariants():
+    assert len(config.CLASSES) == 13
+    assert len({style.name for style in config.CLASSES}) == len(config.CLASSES)
+    assert len({style.color for style in config.CLASSES}) == len(config.CLASSES)
+    assert all(re.fullmatch(r"#[0-9a-fA-F]{6}", style.color) for style in config.CLASSES)
+    assert all(isinstance(style.display, str) and style.display for style in config.CLASSES)
+
+
+def test_canned_classes_are_a_registry_subset():
+    assert config.CANNED_CLASSES == (
+        "Cerrado",
+        "Forest",
+        "Pasture",
+        "Soy_Corn",
+        "Soy_Cotton",
+        "Soy_Fallow",
+        "Soy_Millet",
+    )
+    assert set(config.CANNED_CLASSES) <= set(config.CLASS_NAMES)
+
+
+def test_mapbiomas_classes_are_registered():
+    from agro_predictor.mapbiomas import CLASS_MAP
+
+    assert set(CLASS_MAP.values()) <= set(config.CLASS_NAMES)

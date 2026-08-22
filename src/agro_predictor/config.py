@@ -57,6 +57,7 @@ class RunConfig:
     # When set, train ONLY on series extracted at these points (era-calibrated
     # samples, e.g. from MapBiomas) instead of the canned sitsdata set.
     samples_csv: Path | None = None
+    local_data_dir: Path | None = None
 
     @property
     def output_dir(self) -> Path:
@@ -86,3 +87,56 @@ def full_state(
         memsize_gb=12,
         multicores=6,
     )
+
+
+@dataclass(frozen=True)
+class ClassStyle:
+    name: str
+    display: str
+    color: str
+
+
+CLASSES: tuple[ClassStyle, ...] = (
+    ClassStyle("Cerrado", "Cerrado (savanna)", "#a1d99b"),
+    ClassStyle("Forest", "Forest", "#00441b"),
+    ClassStyle("Pasture", "Pasture", "#fee391"),
+    ClassStyle("Planted_Forest", "Eucalyptus / planted forest", "#238b45"),
+    ClassStyle("Soybean", "Soybean (any rotation)", "#fe9929"),
+    ClassStyle("Sugarcane", "Sugarcane", "#dd3497"),
+    ClassStyle("Water", "Water", "#225ea8"),
+    ClassStyle("Wetland", "Wetland", "#41b6c4"),
+    ClassStyle("Grassland", "Grassland", "#d9f0a3"),
+    ClassStyle("Soy_Corn", "Soy → corn", "#ec7014"),
+    ClassStyle("Soy_Cotton", "Soy → cotton", "#807dba"),
+    ClassStyle("Soy_Fallow", "Soy → fallow", "#fdd0a2"),
+    ClassStyle("Soy_Millet", "Soy → millet", "#d94801"),
+)
+
+CLASS_NAMES: tuple[str, ...] = tuple(style.name for style in CLASSES)
+CANNED_CLASSES: tuple[str, ...] = (
+    "Cerrado",
+    "Forest",
+    "Pasture",
+    "Soy_Corn",
+    "Soy_Cotton",
+    "Soy_Fallow",
+    "Soy_Millet",
+)
+
+IBGE_STATE_AREAS_KM2 = {"MS": 357_142.01, "GO": 340_242.86}
+
+
+def class_style(name: str) -> ClassStyle:
+    """Return the registered style or a stable tab10 fallback."""
+    import hashlib
+
+    from matplotlib import colormaps
+    from matplotlib import colors as mcolors
+
+    styles = {style.name: style for style in CLASSES}
+    if name in styles:
+        return styles[name]
+
+    color_index = hashlib.sha256(name.encode("utf-8")).digest()[0] % 10
+    color = mcolors.to_hex(colormaps["tab10"](color_index))
+    return ClassStyle(name=name, display=name, color=color)

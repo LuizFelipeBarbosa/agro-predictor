@@ -22,6 +22,12 @@ streams the cloud-optimized GeoTIFFs during classification — no manual
 downloads. (If you do have a `BDC_ACCESS_KEY` in the environment, sits will
 use it; it is optional.)
 
+On networks where COG streaming is unreliable, run
+`agro-predictor prefetch --preset full --state MS` to download the required
+files into the shared local cache, then use
+`agro-predictor run --preset full --state MS --local-data` to classify from
+that cache instead of streaming over HTTP.
+
 ## Setup
 
 ```sh
@@ -102,8 +108,30 @@ Each run writes to `output/<run-name>/`:
 | `training_labels.csv` | labels table at training start (includes points later dropped for incomplete series) |
 | `review.csv` | predicted vs. user label at each labeled point |
 
-Classes: Cerrado, Forest, Pasture, Soy_Corn, Soy_Cotton, Soy_Fallow, Soy_Millet;
-user labels can extend this list.
+Classes: see `config.CLASSES` for the full registry (13 built-in classes with
+display names and colors); user labels can extend this list.
+
+### Areas and percentages
+
+The `areas` command clips an existing run's mosaic to the state boundary,
+computes per-class km² and percentages, writes `areas.csv` and `areas.json`,
+and regenerates `classified_preview.png` with display names and percentages.
+It can also compare the results with a named benchmark:
+
+```sh
+uv run agro-predictor areas --dir output/ms-2025-2026 --state MS --compare siga-ms-2023-24
+```
+
+### Spatial holdout validation
+
+Run `split-samples` on the era-sample CSV, then retrain with `run --samples-csv ..._train.csv`.
+Validate the retrained map with `validate-map --points ..._holdout.csv`.
+The `accuracy.json` caveat notes these are MapBiomas-derived weak labels, not field truth;
+independence holds only when retraining excluded the holdout points.
+An irreducibly co-located class falls back to a point-level split with a loud warning.
+Regenerating samples with the diversity-capped `make-samples` sampler is recommended for better
+spatial coverage; because the CSV changes, extraction caches are invalidated and the next
+`run`/`validate` re-extracts instead of reusing a cached RDS.
 
 ## Known limitations
 
