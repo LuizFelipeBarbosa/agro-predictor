@@ -10,11 +10,14 @@ not for a publishable map.
 from pysits import load_samples, sits_bands, sits_select, sits_timeline
 from pysits import summary as sits_summary
 
+from agro_predictor.config import validate_canned_sample_bands
+
 SAMPLES_NAME = "samples_matogrosso_mod13q1"
 EXPECTED_TIMELINE_STEPS = 23
 
 
 def load_training_samples(bands: tuple[str, ...]):
+    validate_canned_sample_bands(bands)
     samples = load_samples(SAMPLES_NAME, package="sitsdata")
     return sits_select(samples, bands=list(bands))
 

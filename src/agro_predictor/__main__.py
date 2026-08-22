@@ -47,13 +47,56 @@ def main() -> int:
         return 0
 
     if args.command == "validate":
+        from agro_predictor import config
         from agro_predictor.pipeline import validate
 
-        validate(
-            multicores=args.multicores,
-            use_labels=not args.no_labels,
-            samples_csv=Path(args.samples_csv) if args.samples_csv else None,
-        )
+        if args.preset == "smoke":
+            cfg = config.smoke()
+        else:
+            cfg = config.full_state(
+                args.state,
+                start_date=args.start or config.CROP_YEAR_START,
+                end_date=args.end or config.CROP_YEAR_END,
+            )
+        overrides = {
+            "start_date": args.start,
+            "end_date": args.end,
+            "bands": args.bands,
+            "multicores": args.multicores,
+            "num_trees": args.num_trees,
+            "mtry": args.mtry,
+            "rebalance": args.rebalance,
+        }
+        cfg = replace(cfg, **{key: value for key, value in overrides.items() if value})
+        cfg = replace(cfg, use_labels=not args.no_labels)
+        if args.samples_csv:
+            cfg = replace(cfg, samples_csv=Path(args.samples_csv))
+
+        if args.local_data:
+            from agro_predictor import prefetch
+
+            assets = prefetch.list_run_assets(cfg)
+            missing = [
+                prefetch._destination_path(asset, prefetch.DEFAULT_CACHE_DIR)
+                for asset in assets
+                if not prefetch._destination_path(asset, prefetch.DEFAULT_CACHE_DIR).exists()
+            ]
+            if missing:
+                command = (
+                    "agro-predictor prefetch "
+                    f"--preset {args.preset} --state {args.state} "
+                    f"--start {cfg.start_date} --end {cfg.end_date} "
+                    f"--bands {','.join(cfg.bands)}"
+                )
+                print(
+                    f"Local cache is missing {len(missing)} of {len(assets)} "
+                    "required files. Run this first:\n"
+                    f"  {command}"
+                )
+                return 1
+            cfg = replace(cfg, local_data_dir=prefetch.DEFAULT_CACHE_DIR)
+
+        validate(cfg, holdout_csv=args.holdout_csv)
         return 0
 
     if args.command == "make-samples":
@@ -118,6 +161,7 @@ def main() -> int:
         date_overrides = {
             "start_date": args.start,
             "end_date": args.end,
+            "bands": args.bands,
         }
         cfg = replace(
             cfg,
@@ -146,6 +190,10 @@ def main() -> int:
             "end_date": args.end,
             "memsize_gb": args.memsize,
             "multicores": args.multicores,
+            "bands": args.bands,
+            "num_trees": args.num_trees,
+            "mtry": args.mtry,
+            "rebalance": args.rebalance,
         }
         cfg = replace(cfg, **{key: value for key, value in overrides.items() if value})
         cfg = replace(cfg, use_labels=not args.no_labels)
@@ -165,7 +213,8 @@ def main() -> int:
                 command = (
                     "agro-predictor prefetch "
                     f"--preset {args.preset} --state {args.state} "
-                    f"--start {cfg.start_date} --end {cfg.end_date}"
+                    f"--start {cfg.start_date} --end {cfg.end_date} "
+                    f"--bands {','.join(cfg.bands)}"
                 )
                 print(
                     f"Local cache is missing {len(missing)} of {len(assets)} "
@@ -293,6 +342,22 @@ def _labels_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _parse_bands(value: str) -> tuple[str, ...]:
+    return tuple(band.strip().upper() for band in value.split(",") if band.strip())
+
+
+def _parse_rebalance(value: str) -> tuple[int, int]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("rebalance must be OVER,UNDER (for example 400,400)")
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "rebalance must be OVER,UNDER using integers (for example 400,400)"
+        ) from error
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="agro-predictor",
@@ -349,14 +414,32 @@ def _parse_args() -> argparse.Namespace:
     fetch_roi.add_argument("--state", default="MS", help="state code (UF), e.g. MS, GO")
     sub.add_parser("samples-info", help="describe the training sample set")
 
-    validate = sub.add_parser("validate", help="5-fold cross-validation of the model")
+    validate = sub.add_parser("validate", help="score the model with k-fold or holdout data")
+    validate.add_argument("--preset", choices=("smoke", "full"), default="smoke")
+    validate.add_argument("--state", default="MS", help="state code (UF) for --preset full")
+    validate.add_argument("--start", help="override start date (YYYY-MM-DD)")
+    validate.add_argument("--end", help="override end date (YYYY-MM-DD)")
+    validate.add_argument("--bands", type=_parse_bands, help="comma-separated SITS band ids")
     validate.add_argument("--multicores", type=int, default=4)
+    validate.add_argument("--num-trees", type=int, help="random forest tree count")
+    validate.add_argument("--mtry", type=int, help="random forest variables per split")
+    validate.add_argument(
+        "--rebalance",
+        type=_parse_rebalance,
+        help="oversampling and undersampling targets as OVER,UNDER",
+    )
     validate.add_argument(
         "--no-labels", action="store_true", help="train on canned samples only"
     )
     validate.add_argument(
         "--samples-csv",
         help="validate cached era samples from this CSV instead of canned samples",
+    )
+    validate.add_argument("--holdout-csv", type=Path, help="independent holdout samples CSV")
+    validate.add_argument(
+        "--local-data",
+        action="store_true",
+        help="extract missing holdout caches from the prefetched local BDC cache",
     )
 
     split_samples = sub.add_parser(
@@ -409,6 +492,7 @@ def _parse_args() -> argparse.Namespace:
     prefetch.add_argument("--state", default="MS", help="state code (UF) for --preset full")
     prefetch.add_argument("--start", help="override start date (YYYY-MM-DD)")
     prefetch.add_argument("--end", help="override end date (YYYY-MM-DD)")
+    prefetch.add_argument("--bands", type=_parse_bands, help="comma-separated SITS band ids")
 
     run = sub.add_parser("run", help="run the classification pipeline")
     run.add_argument("--preset", choices=("smoke", "full"), default="smoke")
@@ -422,6 +506,14 @@ def _parse_args() -> argparse.Namespace:
     run.add_argument("--end", help="override end date (YYYY-MM-DD)")
     run.add_argument("--memsize", type=int, help="override memory budget in GB")
     run.add_argument("--multicores", type=int, help="override worker count")
+    run.add_argument("--bands", type=_parse_bands, help="comma-separated SITS band ids")
+    run.add_argument("--num-trees", type=int, help="random forest tree count")
+    run.add_argument("--mtry", type=int, help="random forest variables per split")
+    run.add_argument(
+        "--rebalance",
+        type=_parse_rebalance,
+        help="oversampling and undersampling targets as OVER,UNDER",
+    )
     run.add_argument("--no-labels", action="store_true", help="train on canned samples only")
     run.add_argument(
         "--local-data",

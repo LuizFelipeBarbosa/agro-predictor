@@ -20,6 +20,15 @@ DOWNLOAD_ATTEMPTS = 6
 DOWNLOAD_TIMEOUT_SECONDS = 120
 USER_AGENT = "agro-predictor"
 
+SITS_BAND_TO_STAC_ASSET = {
+    "NDVI": "NDVI",
+    "EVI": "EVI",
+    "BLUE": "blue_reflectance",
+    "RED": "red_reflectance",
+    "NIR": "NIR_reflectance",
+    "MIR": "MIR_reflectance",
+}
+
 
 def _bbox(config: RunConfig) -> tuple[float, float, float, float]:
     roi = load_roi(config.roi)
@@ -59,9 +68,14 @@ def _assets_from_item(item: dict, bands: tuple[str, ...]) -> list[dict]:
     item_assets = item.get("assets", {})
     assets = []
     for band in bands:
-        if band not in item_assets:
+        try:
+            asset_key = SITS_BAND_TO_STAC_ASSET[band]
+        except KeyError as error:
+            known = ", ".join(sorted(SITS_BAND_TO_STAC_ASSET))
+            raise ValueError(f"Unknown SITS band {band!r}; known bands: {known}") from error
+        if asset_key not in item_assets:
             continue
-        asset = item_assets[band]
+        asset = item_assets[asset_key]
         assets.append(
             {
                 "tile": tile,
@@ -86,6 +100,14 @@ def list_run_assets(config: RunConfig) -> list[dict]:
         if len(features) < STAC_PAGE_SIZE:
             break
         page += 1
+
+    matched_bands = {asset["band"] for asset in assets}
+    unmatched_bands = sorted(set(config.bands) - matched_bands)
+    if unmatched_bands:
+        raise RuntimeError(
+            "No STAC assets matched requested band(s): "
+            f"{', '.join(unmatched_bands)}. The BDC asset schema may have changed."
+        )
     return assets
 
 

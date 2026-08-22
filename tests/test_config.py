@@ -1,6 +1,8 @@
 import re
 from datetime import date
 
+import pytest
+
 from agro_predictor import config
 
 
@@ -51,6 +53,28 @@ def test_brazil_bbox_contains_smoke_bbox():
 def test_presets_use_labels_by_default():
     assert config.smoke().use_labels is True
     assert config.full_state().use_labels is True
+    assert config.smoke().num_trees == 100
+    assert config.smoke().mtry is None
+    assert config.smoke().rebalance is None
+
+
+def test_run_config_rejects_unknown_bands():
+    with pytest.raises(ValueError, match=r"Unknown band\(s\): GREEN.*Known bands:.*NDVI.*MIR"):
+        config.RunConfig(
+            name="invalid",
+            start_date="2023-09-14",
+            end_date="2024-08-31",
+            roi=config.SMOKE_BBOX,
+            bands=("NDVI", "GREEN"),
+        )
+
+
+def test_canned_sample_band_validation_rejects_red_and_blue():
+    with pytest.raises(
+        ValueError,
+        match=r"Canned samples do not support band\(s\): BLUE, RED.*NDVI, EVI, NIR, MIR",
+    ):
+        config.validate_canned_sample_bands(("NDVI", "RED", "BLUE"))
 
 
 def test_class_registry_invariants():

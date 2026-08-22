@@ -4,7 +4,6 @@ Follows the canonical sits workflow. sits streams the Brasil Data Cube COGs
 over HTTP during classification, so there is no separate download step.
 """
 
-import dataclasses
 import json
 import os
 import tempfile
@@ -25,14 +24,23 @@ from pysits import (
     sits_kfold_validate,
     sits_label_classification,
     sits_labels,
+    sits_reduce_imbalance,
     sits_rfor,
     sits_smooth,
     sits_timeline,
     sits_train,
+    sits_validate,
 )
 
 from agro_predictor import areas
+from agro_predictor import validation as validation_metrics
 from agro_predictor.config import LABELS_CACHE_DIR, OUTPUT_ROOT, RunConfig
+from agro_predictor.experiment import (
+    cache_is_current,
+    era_cache_paths,
+    reject_rebalance_in_kfold,
+    variant_slug,
+)
 from agro_predictor.labels import (
     canonical_frame,
     extraction_cache_key,
@@ -118,20 +126,19 @@ def align_samples_to_cube(samples, cube):
     return trimmed
 
 
-def load_era_samples(config: RunConfig, cube):
-    """Extract training series at config.samples_csv points from the run's cube.
+def load_era_samples(config: RunConfig, cube, csv_path: Path | None = None):
+    """Extract training series at CSV points from the run's cube.
 
     The extraction is the expensive step (one HTTP-streamed series per point),
     so the result is RDS-cached next to the CSV.
     """
-    csv_path = Path(config.samples_csv)
-    rds_path = csv_path.with_suffix(".rds")
-    if rds_path.exists() and rds_path.stat().st_mtime >= csv_path.stat().st_mtime:
+    csv_path = Path(config.samples_csv) if csv_path is None else Path(csv_path)
+    rds_path, raw_path = era_cache_paths(csv_path, config.bands)
+    if cache_is_current(rds_path, csv_path):
         print(f"Era-sample cache hit: {rds_path}")
         return read_rds(str(rds_path))
 
-    raw_path = csv_path.with_suffix(".raw.rds")
-    if raw_path.exists() and raw_path.stat().st_mtime >= csv_path.stat().st_mtime:
+    if cache_is_current(raw_path, csv_path):
         print(f"Raw extraction cache hit: {raw_path}")
         samples = read_rds(str(raw_path))
     else:
@@ -195,11 +202,11 @@ def _configure_gdal_http() -> None:
         os.environ.setdefault(key, value)
 
 
-def _save_rds(samples, path: Path) -> None:
+def _save_rds(obj, path: Path) -> None:
     import rpy2.robjects as ro
 
     # Deliberate private-attribute access is contained at the pysits/R boundary.
-    ro.r["saveRDS"](samples._instance, str(path))
+    ro.r["saveRDS"](obj._instance, str(path))
 
 
 def _filter_full_series(samples, steps: int = EXPECTED_TIMELINE_STEPS):
@@ -334,6 +341,24 @@ def load_run_samples(config: RunConfig):
     return merged
 
 
+def _make_ml_method(config: RunConfig):
+    kwargs = {"num_trees": config.num_trees}
+    if config.mtry is not None:
+        kwargs["mtry"] = config.mtry
+    return sits_rfor(**kwargs)
+
+
+def _maybe_rebalance(samples, config: RunConfig):
+    if config.rebalance is None:
+        return samples
+    return sits_reduce_imbalance(
+        samples,
+        n_samples_over=config.rebalance[0],
+        n_samples_under=config.rebalance[1],
+        multicores=config.multicores,
+    )
+
+
 def run(config: RunConfig) -> Path:
     _configure_gdal_http()
     output_dir = config.output_dir
@@ -349,7 +374,9 @@ def run(config: RunConfig) -> Path:
     else:
         samples = load_run_samples(config)
         samples = align_samples_to_cube(samples, cube)
-    model = sits_train(samples, sits_rfor())
+    samples = _maybe_rebalance(samples, config)
+    model = sits_train(samples, _make_ml_method(config))
+    _save_rds(model, output_dir / "model.rds")
 
     print(f"Classifying (memsize={config.memsize_gb}GB, multicores={config.multicores})...")
     probs = sits_classify(
@@ -388,6 +415,10 @@ def run(config: RunConfig) -> Path:
                 "version": config.version,
                 "start_date": config.start_date,
                 "end_date": config.end_date,
+                "bands": list(config.bands),
+                "num_trees": config.num_trees,
+                "mtry": config.mtry,
+                "rebalance": list(config.rebalance) if config.rebalance else None,
             },
             indent=2,
         )
@@ -569,40 +600,20 @@ def _symlink_result_tifs(output_dir: Path, scratch_dir: Path, band: str) -> Path
     return data_dir
 
 
-def validate(
-    multicores: int = 4,
-    use_labels: bool = True,
-    samples_csv: Path | None = None,
-) -> None:
-    """Run 5-fold cross-validation on the available training samples.
+def validate(config: RunConfig, holdout_csv: Path | None = None) -> None:
+    """Score configured samples with either 5-fold or independent holdout validation."""
+    if holdout_csv is not None:
+        _validate_holdout(config, Path(holdout_csv))
+        return
 
-    User-labeled samples are included when present and enabled. Classes with
-    fewer samples than folds are excluded because they cannot be validated.
-    Accuracy on training samples is not map accuracy for the classified region;
-    assessing that requires independent local ground truth.
-    """
-    if samples_csv is not None:
-        rds_path = Path(samples_csv).with_suffix(".rds")
-        if not rds_path.exists():
-            raise RuntimeError(
-                f"No cached samples at {rds_path}; run "
-                f"`agro-predictor run --samples-csv {samples_csv}` once first to "
-                "build the cache (extraction needs a cube/network; validate stays cheap)."
-            )
-        if rds_path.stat().st_mtime < Path(samples_csv).stat().st_mtime:
-            raise RuntimeError(
-                f"Samples CSV {samples_csv} changed since extraction; run "
-                f"`agro-predictor run --samples-csv {samples_csv}` again to "
-                "re-extract before validating."
-            )
-        samples = read_rds(str(rds_path))
+    reject_rebalance_in_kfold(config.rebalance)
+    if config.samples_csv is not None:
+        samples = _load_kfold_era_cache(config)
+        train_name = Path(config.samples_csv).stem
     else:
-        from agro_predictor.config import smoke
-
-        config = dataclasses.replace(
-            smoke(), multicores=multicores, use_labels=use_labels
-        )
         samples = load_run_samples(config)
+        train_name = "canned"
+
     counts = _class_counts(samples)
     excluded = {label: count for label, count in counts.items() if count < 5}
     for label, count in excluded.items():
@@ -613,7 +624,10 @@ def validate(
 
     print("Running 5-fold cross-validation (random forest)...")
     assessment = sits_kfold_validate(
-        samples, folds=5, ml_method=sits_rfor(), multicores=multicores
+        samples,
+        folds=5,
+        ml_method=_make_ml_method(config),
+        multicores=config.multicores,
     )
     summary = sits_accuracy_summary(assessment)
     print(summary)
@@ -623,16 +637,168 @@ def validate(
     if assessment_text.strip() and assessment_text.strip() != summary_text.strip():
         summary_text = f"{summary_text.rstrip()}\n\n{assessment_text.rstrip()}"
 
-    name = Path(samples_csv).stem if samples_csv is not None else "canned"
-    validation_dir = (
-        OUTPUT_ROOT
-        / "validation"
-        / f"{name}-{date.today().isoformat()}"  # noqa: DTZ011
-    )
+    validation_dir = _validation_output_dir(config, train_name)
     validation_dir.mkdir(parents=True, exist_ok=True)
     summary_path = validation_dir / "summary.txt"
     summary_path.write_text(f"{summary_text.rstrip()}\n", encoding="utf-8")
     print(f"Validation summary saved: {summary_path}")
+
+
+def _load_kfold_era_cache(config: RunConfig):
+    csv_path = Path(config.samples_csv)
+    rds_path, _ = era_cache_paths(csv_path, config.bands)
+    bands = ",".join(config.bands)
+    if not rds_path.exists():
+        raise RuntimeError(
+            f"No band-aware sample cache at {rds_path} for bands {bands}; run "
+            f"`agro-predictor run --samples-csv {csv_path} --bands {bands}` once first. "
+            "Alternatively, holdout mode can auto-extract train and holdout caches with "
+            "`--local-data`."
+        )
+    if not cache_is_current(rds_path, csv_path):
+        raise RuntimeError(
+            f"Band-aware sample cache {rds_path} is older than {csv_path}; run "
+            f"`agro-predictor run --samples-csv {csv_path} --bands {bands}` again. "
+            "Alternatively, holdout mode can refresh train and holdout caches with "
+            "`--local-data`."
+        )
+    return read_rds(str(rds_path))
+
+
+def _validate_holdout(config: RunConfig, holdout_csv: Path) -> None:
+    if config.samples_csv is None:
+        raise ValueError("--holdout-csv requires --samples-csv for the training samples")
+
+    train_csv = Path(config.samples_csv)
+    if config.local_data_dir is not None:
+        cube = build_cube(config)
+        train_samples = load_era_samples(config, cube, csv_path=train_csv)
+        holdout_samples = load_era_samples(config, cube, csv_path=holdout_csv)
+    else:
+        train_samples, holdout_samples = _load_holdout_era_caches(
+            config, train_csv, holdout_csv
+        )
+
+    train_samples = _maybe_rebalance(train_samples, config)
+    print("Running independent holdout validation (random forest)...")
+    assessment = sits_validate(
+        train_samples,
+        samples_validation=holdout_samples,
+        ml_method=_make_ml_method(config),
+    )
+    cm = pd.DataFrame(assessment.table).T
+    cm.index.name = "reference"
+    cm.columns.name = "predicted"
+    metrics = validation_metrics.accuracy_metrics(cm)
+
+    caveat = (
+        "This is a point-level model score that skips Bayesian smoothing, unlike a full "
+        "classify+smooth run."
+    )
+    payload = {
+        **metrics,
+        "n_points": int(cm.to_numpy().sum()),
+        "n_unsampled": 0,
+        "points_csv": str(holdout_csv),
+        "state": _config_state(config),
+        "generated_on": date.today().isoformat(),  # noqa: DTZ011
+        "reference": "mapbiomas-c10",
+        "caveat": caveat,
+        "bands": list(config.bands),
+        "num_trees": config.num_trees,
+        "mtry": config.mtry,
+        "rebalance": list(config.rebalance) if config.rebalance else None,
+    }
+
+    validation_dir = _validation_output_dir(
+        config,
+        train_csv.stem,
+        holdout_name=holdout_csv.stem,
+    )
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    cm.to_csv(validation_dir / "confusion_matrix.csv")
+    (validation_dir / "accuracy.json").write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    per_class = pd.DataFrame.from_dict(metrics["per_class"], orient="index")
+    per_class.index.name = "class"
+    summary_text = (
+        "Independent holdout validation\n"
+        f"Train samples: {train_csv}\n"
+        f"Holdout samples: {holdout_csv}\n"
+        f"Bands: {', '.join(config.bands)}\n"
+        f"Random forest: num_trees={config.num_trees}, mtry={config.mtry}\n"
+        f"Rebalance: {config.rebalance}\n"
+        f"Overall accuracy: {metrics['overall_accuracy']:.4f}\n"
+        f"Kappa: {metrics['kappa']:.4f}\n\n"
+        f"{per_class.to_string()}\n\n"
+        f"Caveat: {caveat}\n"
+    )
+    summary_path = validation_dir / "summary.txt"
+    summary_path.write_text(summary_text, encoding="utf-8")
+    print(f"Overall accuracy: {metrics['overall_accuracy']:.4f}")
+    print(f"Kappa: {metrics['kappa']:.4f}")
+    print(per_class.to_string())
+    print(f"Validation artifacts saved: {validation_dir}")
+
+
+def _load_holdout_era_caches(config: RunConfig, train_csv: Path, holdout_csv: Path):
+    cache_pairs = []
+    problems = []
+    for csv_path in (train_csv, holdout_csv):
+        rds_path, _ = era_cache_paths(csv_path, config.bands)
+        cache_pairs.append((csv_path, rds_path))
+        if not rds_path.exists():
+            problems.append(f"{rds_path} (missing)")
+        elif not cache_is_current(rds_path, csv_path):
+            problems.append(f"{rds_path} (older than {csv_path.name})")
+
+    if problems:
+        bands = ",".join(config.bands)
+        state = _config_state(config)
+        preset_options = "--preset smoke" if state is None else f"--preset full --state {state}"
+        command = (
+            "agro-predictor validate "
+            f"{preset_options} --start {config.start_date} --end {config.end_date} "
+            f"--samples-csv {train_csv} --holdout-csv {holdout_csv} "
+            f"--bands {bands} --local-data"
+        )
+        details = "\n  ".join(problems)
+        raise RuntimeError(
+            "Missing or stale band-aware sample cache(s):\n"
+            f"  {details}\n"
+            "Build both from the prefetched local cube with:\n"
+            f"  {command}"
+        )
+
+    return tuple(read_rds(str(rds_path)) for _, rds_path in cache_pairs)
+
+
+def _validation_output_dir(
+    config: RunConfig,
+    train_name: str,
+    holdout_name: str | None = None,
+) -> Path:
+    name = train_name if holdout_name is None else f"{train_name}-vs-{holdout_name}"
+    variant = variant_slug(
+        config.bands,
+        config.num_trees,
+        config.mtry,
+        config.rebalance,
+    )
+    return (
+        OUTPUT_ROOT
+        / "validation"
+        / f"{name}-{date.today().isoformat()}-{variant}"  # noqa: DTZ011
+    )
+
+
+def _config_state(config: RunConfig) -> str | None:
+    if not isinstance(config.roi, Path):
+        return None
+    return config.roi.stem.split("_")[0].upper()
 
 
 def _finalize(output_dir: Path, name: str, config: RunConfig) -> None:

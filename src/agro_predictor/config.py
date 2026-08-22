@@ -9,6 +9,8 @@ ROI_DIR = PROJECT_ROOT / "data" / "roi"
 LABELS_DIR = PROJECT_ROOT / "data" / "labels"
 LABELS_CSV_PATH = LABELS_DIR / "labels.csv"
 LABELS_CACHE_DIR = LABELS_DIR / "cache"
+KNOWN_BANDS = ("NDVI", "EVI", "BLUE", "RED", "NIR", "MIR")
+CANNED_SAMPLE_BANDS = ("NDVI", "EVI", "NIR", "MIR")
 
 # BDC data on data.inpe.br is open access (verified 2026-08: anonymous range
 # requests succeed) and sits ships a default token, so no BDC_ACCESS_KEY is
@@ -52,6 +54,9 @@ class RunConfig:
     source: str = "BDC"
     memsize_gb: int = 8
     multicores: int = 4
+    num_trees: int = 100
+    mtry: int | None = None
+    rebalance: tuple[int, int] | None = None
     version: str = "v1"
     use_labels: bool = True
     # When set, train ONLY on series extracted at these points (era-calibrated
@@ -59,9 +64,27 @@ class RunConfig:
     samples_csv: Path | None = None
     local_data_dir: Path | None = None
 
+    def __post_init__(self) -> None:
+        unknown = sorted(set(self.bands) - set(KNOWN_BANDS))
+        if unknown:
+            raise ValueError(
+                f"Unknown band(s): {', '.join(unknown)}. "
+                f"Known bands: {', '.join(KNOWN_BANDS)}"
+            )
+
     @property
     def output_dir(self) -> Path:
         return OUTPUT_ROOT / self.name
+
+
+def validate_canned_sample_bands(bands: tuple[str, ...]) -> None:
+    """Reject bands that are absent from the bundled Mato Grosso samples."""
+    unsupported = sorted(set(bands) - set(CANNED_SAMPLE_BANDS))
+    if unsupported:
+        raise ValueError(
+            f"Canned samples do not support band(s): {', '.join(unsupported)}. "
+            f"Available canned bands: {', '.join(CANNED_SAMPLE_BANDS)}"
+        )
 
 
 def smoke() -> RunConfig:
